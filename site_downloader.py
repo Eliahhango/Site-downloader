@@ -479,8 +479,48 @@ def download_site(
     log(f"Pages downloaded: {len(seen_pages)}")
     log(f"Assets downloaded: {len(downloaded_assets)}")
     target_dir = output_dir / root_host if (output_dir / root_host).exists() else output_dir
+    neutralize_webflow_branding(target_dir)
     log(f"Saved to: {target_dir.resolve()}")
     return target_dir
+
+
+def neutralize_webflow_branding(target_dir: pathlib.Path) -> None:
+    """Neutralizes Webflow badge/branding injection in all JS and CSS files."""
+    brand_pattern = re.compile(
+        r'a\.define\(\s*["\']brand["\']\s*,\s*e\.exports\s*=\s*function\s*\([^\)]*\)\s*\{[\s\S]*?\}\s*\)\s*\}'
+    )
+    badge_css = "\n\n/* Suppress Webflow brand badge */\n.w-webflow-badge { display: none !important; opacity: 0 !important; visibility: hidden !important; pointer-events: none !important; }\n"
+
+    for js_file in target_dir.rglob("*.js"):
+        try:
+            content = js_file.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        modified = False
+        if brand_pattern.search(content):
+            content = brand_pattern.sub(
+                'a.define("brand",e.exports=function(){return{ready:function(){try{var b=document.querySelector(".w-webflow-badge");if(b)b.remove();}catch(e){}}}})})}',
+                content,
+                count=1,
+            )
+            modified = True
+        if "utm_campaign=brandjs" in content:
+            content = content.replace("utm_campaign=brandjs", "utm_campaign=disabled")
+            modified = True
+        if modified:
+            try:
+                js_file.write_text(content, encoding="utf-8")
+                log(f"[BRAND] Disarmed Webflow badge in: {js_file.name}")
+            except OSError:
+                pass
+
+    for css_file in target_dir.rglob("*.css"):
+        try:
+            css_content = css_file.read_text(encoding="utf-8", errors="ignore")
+            if ".w-webflow-badge" not in css_content:
+                css_file.write_text(css_content + badge_css, encoding="utf-8")
+        except OSError:
+            pass
 
 
 # ============================================================================
@@ -515,6 +555,7 @@ class ReactConverter:
 
         log(f"[REACT] Found {len(html_files)} HTML pages.")
         self._localize_all_assets(html_files)
+        neutralize_webflow_branding(self.assets_dir)
         self._extract_interaction_styles(html_files)
         self._generate_hook()
         converted_routes = self._convert_pages(html_files)
@@ -631,6 +672,15 @@ class ReactConverter:
     def _extract_interaction_styles(self, html_files: list[pathlib.Path]) -> None:
         """Extracts CSS animation/interaction initial state rules into page-interactions.css."""
         unique_styles: set[str] = set()
+        unique_styles.add(
+            "/* Suppress Webflow badge */\n"
+            ".w-webflow-badge {\n"
+            "  display: none !important;\n"
+            "  opacity: 0 !important;\n"
+            "  visibility: hidden !important;\n"
+            "  pointer-events: none !important;\n"
+            "}"
+        )
         for f in html_files:
             try:
                 content = f.read_text(encoding="utf-8", errors="ignore")
