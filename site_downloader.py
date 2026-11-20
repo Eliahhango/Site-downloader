@@ -1,25 +1,23 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
-Site Downloader & React App Converter
-======================================
+Site Downloader & React App Converter (v2.0)
+============================================
 1. Downloads entire websites with all assets (images, fonts, styles, scripts, CDN files).
 2. Automatically converts downloaded sites into modern, production-ready Vite + React apps
    without destroying page structure, Webflow / GSAP animations, interactions, or styles.
+3. Automatically disarms Webflow badge & copyright branding.
+4. Interactive OpenCode-style terminal UI with zero-config auto-bootstrapping.
 
 Usage:
-  # Download and automatically convert to a React app:
+  # Interactive Wizard (recommended):
+  python site_downloader.py
+
+  # Headless CLI Mode:
   python site_downloader.py https://example.com -o downloaded_site --to-react
-
-  # Specify a custom React output directory:
-  python site_downloader.py https://example.com -o downloaded_site --to-react my-react-app
-
-  # Convert an already downloaded website directory into a React app:
-  python site_downloader.py --convert-dir ./downloaded_site --react-out ./my-react-app
 """
 
 from __future__ import annotations
 
-import argparse
 import collections
 import concurrent.futures
 import hashlib
@@ -29,14 +27,259 @@ import pathlib
 import posixpath
 import re
 import shutil
+import subprocess
+import sys
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
 from typing import Iterable
 from urllib.parse import unquote, urldefrag, urljoin, urlparse
 
+# ============================================================================
+# Windows ANSI Support & Dependency Bootstrapper
+# ============================================================================
+
+def _enable_windows_ansi() -> None:
+    if os.name == "nt":
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+            mode = ctypes.c_ulong()
+            kernel32.GetConsoleMode(handle, ctypes.byref(mode))
+            mode.value |= 0x0004  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            kernel32.SetConsoleMode(handle, mode)
+        except Exception:
+            pass
+
+_enable_windows_ansi()
+
+REQUIRED_PACKAGES = [
+    ("requests", "requests>=2.32.0"),
+    ("bs4", "beautifulsoup4>=4.12.0"),
+]
+
+def bootstrap_environment() -> None:
+    """Verifies Python version and automatically installs missing dependencies via pip."""
+    if sys.version_info < (3, 8):
+        print(f"\033[1;31m[ERROR] Python 3.8 or newer is required. You are using Python {sys.version.split()[0]}.\033[0m")
+        sys.exit(1)
+
+    missing = []
+    for mod, pkg in REQUIRED_PACKAGES:
+        try:
+            __import__(mod)
+        except ImportError:
+            missing.append(pkg)
+
+    if missing:
+        print("\n\033[1;36m╭─ Dependency Bootstrapper ───────────────────────────────────────╮\033[0m")
+        print(f"\033[1;36m│\033[0m  \033[1;33m⚡ Missing dependencies detected:\033[0m {', '.join(missing)}")
+        print("\033[1;36m│\033[0m  \033[32mInstalling automatically via pip...\033[0m")
+        print("\033[1;36m╰─────────────────────────────────────────────────────────────────╯\033[0m\n")
+        try:
+            # Upgrade pip silently
+            subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "pip"], capture_output=True)
+            # Install missing packages
+            subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
+            print("\033[1;32m✔ All dependencies installed successfully!\033[0m\n")
+        except Exception as e:
+            print(f"\033[1;31m✖ Failed to auto-install dependencies: {e}\033[0m")
+            print("Please run manually: pip install -r requirements.txt")
+            sys.exit(1)
+
+bootstrap_environment()
+
 import requests
 from bs4 import BeautifulSoup
+
+# ============================================================================
+# OpenCode-Style Terminal UI Engine
+# ============================================================================
+
+class UI:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    CYAN = "\033[38;2;6;182;212m"
+    GREEN = "\033[38;2;16;185;129m"
+    PURPLE = "\033[38;2;139;92;246m"
+    AMBER = "\033[38;2;245;158;11m"
+    RED = "\033[38;2;239;68;68m"
+    BLUE = "\033[38;2;59;130;246m"
+    GRAY = "\033[38;2;156;163;175m"
+    WHITE = "\033[1;37m"
+
+    @classmethod
+    def banner(cls) -> None:
+        w = 68
+        print(f"\n{cls.CYAN}╭{'─' * w}╮{cls.RESET}")
+        print(f"{cls.CYAN}│{cls.RESET}{' ' * w}{cls.CYAN}│{cls.RESET}")
+        logo = [
+            r"   ███████╗██╗████████╗███████╗    ██████╗ ██╗               ",
+            r"   ██╔════╝██║╚══██╔══╝██╔════╝    ██╔══██╗██║               ",
+            r"   ███████╗██║   ██║   █████╗      ██║  ██║██║               ",
+            r"   ╚════██║██║   ██║   ██╔══╝      ██║  ██║██║               ",
+            r"   ███████║██║   ██║   ███████╗    ██████╔╝███████╗          ",
+            r"   ╚══════╝╚═╝   ╚═╝   ╚══════╝    ╚═════╝ ╚══════╝          ",
+        ]
+        for line in logo:
+            padding = w - len(line)
+            print(f"{cls.CYAN}│{cls.RESET}{cls.BOLD}{cls.PURPLE}{line}{cls.RESET}{' ' * padding}{cls.CYAN}│{cls.RESET}")
+        print(f"{cls.CYAN}│{cls.RESET}{' ' * w}{cls.CYAN}│{cls.RESET}")
+        sub1 = "   Autonomous Web-to-React Cloning Engine  •  v2.0"
+        sub2 = "   Zero-Config Site Downloader & Full Component Generator"
+        print(f"{cls.CYAN}│{cls.RESET}{cls.BOLD}{cls.WHITE}{sub1}{cls.RESET}{' ' * (w - len(sub1))}{cls.CYAN}│{cls.RESET}")
+        print(f"{cls.CYAN}│{cls.RESET}{cls.GRAY}{sub2}{cls.RESET}{' ' * (w - len(sub2))}{cls.CYAN}│{cls.RESET}")
+        print(f"{cls.CYAN}╰{'─' * w}╯{cls.RESET}\n")
+
+    @classmethod
+    def system_status(cls) -> None:
+        w = 68
+        node_str = "Not detected"
+        npm_str = "Not detected"
+        node_cmd = shutil.which("node")
+        npm_cmd = shutil.which("npm") or shutil.which("npm.cmd")
+        if node_cmd:
+            try:
+                node_ver = subprocess.check_output([node_cmd, "-v"], text=True).strip()
+                node_str = f"{node_ver}"
+            except Exception:
+                pass
+        if npm_cmd:
+            try:
+                npm_ver = subprocess.check_output([npm_cmd, "-v"], text=True).strip()
+                npm_str = f"npm v{npm_ver}"
+            except Exception:
+                pass
+
+        checks = [
+            ("Python Runtime", True, f"v{sys.version.split()[0]} (Active)"),
+            ("Pip Package Manager", True, "Up to date"),
+            ("Core Dependencies", True, "requests, beautifulsoup4 (Ready)"),
+            ("Node.js & npm", bool(node_cmd), f"{node_str} / {npm_str}" if node_cmd else "Not found in PATH"),
+        ]
+
+        print(f"{cls.PURPLE}╭─ System Environment ───────────────────────────────────────────────╮{cls.RESET}")
+        for label, ok, detail in checks:
+            mark = f"{cls.GREEN}✔{cls.RESET}" if ok else f"{cls.AMBER}!{cls.RESET}"
+            status_text = f" {mark} {cls.WHITE}{label:<24}{cls.RESET} {cls.GRAY}{detail}{cls.RESET}"
+            plain = f" * {label:<24} {detail}"
+            pad = max(1, w - len(plain))
+            print(f"{cls.PURPLE}│{cls.RESET}{status_text}{' ' * pad}{cls.PURPLE}│{cls.RESET}")
+        print(f"{cls.PURPLE}╰{'─' * w}╯{cls.RESET}\n")
+
+    @classmethod
+    def box(cls, title: str, lines: list[str], border_color: str = CYAN) -> None:
+        w = 68
+        header = f"╭─ {title} "
+        header += "─" * max(0, w - len(title) - 4) + "╮"
+        print(f"{border_color}{header}{cls.RESET}")
+        for line in lines:
+            plain = re.sub(r'\033\[[0-9;]*m', '', line)
+            pad = max(0, w - len(plain) - 2)
+            print(f"{border_color}│{cls.RESET}  {line}{' ' * pad}{border_color}│{cls.RESET}")
+        print(f"{border_color}╰{'─' * w}╯{cls.RESET}")
+
+    @classmethod
+    def step(cls, current: int, total: int, title: str) -> None:
+        print(f"\n{cls.CYAN}[{current}/{total}]{cls.RESET} {cls.BOLD}{cls.WHITE}{title}{cls.RESET}")
+
+    @classmethod
+    def item(cls, message: str, status: str = "ok") -> None:
+        if status == "ok":
+            mark = f"{cls.GREEN}✔{cls.RESET}"
+        elif status == "step":
+            mark = f"{cls.CYAN}●{cls.RESET}"
+        elif status == "warn":
+            mark = f"{cls.AMBER}!{cls.RESET}"
+        else:
+            mark = f"{cls.RED}✖{cls.RESET}"
+        print(f"  {mark} {message}")
+
+    @classmethod
+    def warn(cls, message: str) -> None:
+        print(f"  {cls.AMBER}! {message}{cls.RESET}")
+
+    @classmethod
+    def error(cls, message: str) -> None:
+        print(f"  {cls.RED}✖ {message}{cls.RESET}")
+
+    @classmethod
+    def prompt(cls, question: str, default: str = "") -> str:
+        prompt_str = f"  {cls.CYAN}?{cls.RESET} {cls.BOLD}{cls.WHITE}{question}{cls.RESET}"
+        if default:
+            prompt_str += f" {cls.GRAY}[{default}]{cls.RESET}"
+        prompt_str += f"\n  {cls.CYAN}›{cls.RESET} "
+        try:
+            val = input(prompt_str).strip()
+            return val if val else default
+        except (KeyboardInterrupt, EOFError):
+            print(f"\n{cls.GRAY}Operation cancelled.{cls.RESET}")
+            sys.exit(0)
+
+    @classmethod
+    def confirm(cls, question: str, default: bool = True) -> bool:
+        choices = f"{cls.CYAN}Y{cls.RESET}/n" if default else f"y/{cls.CYAN}N{cls.RESET}"
+        prompt_str = f"  {cls.CYAN}?{cls.RESET} {cls.BOLD}{cls.WHITE}{question}{cls.RESET} {cls.GRAY}({choices}){cls.RESET}\n  {cls.CYAN}›{cls.RESET} "
+        try:
+            val = input(prompt_str).strip().lower()
+            if not val:
+                return default
+            return val in ("y", "yes", "true", "1")
+        except (KeyboardInterrupt, EOFError):
+            print(f"\n{cls.GRAY}Operation cancelled.{cls.RESET}")
+            sys.exit(0)
+
+    @classmethod
+    def success_card(cls, target_dir: pathlib.Path, total_pages: int, total_assets: int, react_dir: pathlib.Path | None = None) -> None:
+        lines = [
+            f"{cls.BOLD}{cls.GREEN}Cloning and conversion completed successfully!{cls.RESET}",
+            "",
+            f"{cls.WHITE}Summary:{cls.RESET}",
+            f"  • Downloaded Pages:   {cls.CYAN}{total_pages}{cls.RESET}",
+            f"  • Localized Assets:   {cls.CYAN}{total_assets}{cls.RESET}",
+            f"  • Download Directory: {cls.GRAY}{target_dir}{cls.RESET}",
+        ]
+        if react_dir:
+            lines.extend([
+                f"  • React Application:  {cls.GREEN}{react_dir}{cls.RESET}",
+                "",
+                f"{cls.WHITE}Quick Commands:{cls.RESET}",
+                f"  {cls.CYAN}cd {react_dir.name}{cls.RESET}",
+                f"  {cls.CYAN}npm run dev{cls.RESET}        {cls.GRAY}# Start development server{cls.RESET}",
+                f"  {cls.CYAN}npm run build{cls.RESET}      {cls.GRAY}# Build production bundle{cls.RESET}",
+                f"  {cls.CYAN}npm run preview{cls.RESET}    {cls.GRAY}# Preview production build{cls.RESET}",
+            ])
+        print()
+        cls.box("Project Ready", lines, border_color=cls.GREEN)
+        print()
+
+
+# ============================================================================
+# Logging & Network Helpers
+# ============================================================================
+
+def log(message: str) -> None:
+    if message.startswith("[PAGE]"):
+        parts = message.split(" -> ")
+        page_url = parts[0].replace("[PAGE] ", "").strip()
+        UI.item(f"Discovered Page: {UI.WHITE}{page_url}{UI.RESET}", status="ok")
+    elif message.startswith("[ASSET]"):
+        pass
+    elif message.startswith("[BRAND]"):
+        UI.item(f"Webflow Brand Neutralized: {UI.GREEN}{message.replace('[BRAND] ', '')}{UI.RESET}", status="ok")
+    elif message.startswith("[REACT]"):
+        UI.item(f"{message.replace('[REACT] ', '')}", status="step")
+    elif message.startswith("[SUCCESS]"):
+        UI.item(f"{UI.GREEN}{message.replace('[SUCCESS] ', '')}{UI.RESET}", status="ok")
+    elif message.startswith("[WARN]"):
+        UI.warn(message.replace('[WARN] ', ''))
+    elif message.startswith("[ERROR]"):
+        UI.error(message.replace('[ERROR] ', ''))
+    else:
+        print(f"  {UI.GRAY}{message}{UI.RESET}")
+
 
 ASSET_ATTRS = {
     "img": ["src", "srcset"],
@@ -49,18 +292,6 @@ ASSET_ATTRS = {
 
 SKIP_SCHEMES = ("mailto:", "tel:", "javascript:", "data:", "#")
 TRACKING_QUERY_PREFIXES = ("utm_", "fbclid", "gclid", "mc_")
-
-
-# ============================================================================
-# Logging & Network Helpers
-# ============================================================================
-
-def log(message: str) -> None:
-    try:
-        print(message)
-    except OSError:
-        fallback = message.encode("ascii", errors="backslashreplace").decode("ascii")
-        print(fallback)
 
 
 def normalize_url(raw_url: str) -> str:
@@ -119,9 +350,9 @@ def canonicalize_url(raw_url: str, keep_query: bool) -> str:
 
 def root_domain(host: str) -> str:
     parts = host.split(".")
-    if len(parts) >= 2:
-        return ".".join(parts[-2:])
-    return host
+    if len(parts) <= 2:
+        return host
+    return ".".join(parts[-2:])
 
 
 def in_scope(url: str, root_host: str, include_related_hosts: bool, allow_external_pages: bool) -> bool:
@@ -164,7 +395,7 @@ def to_local_path(url: str, output_dir: pathlib.Path) -> pathlib.Path:
     if "." not in filename:
         path = path + "/index.html"
 
-    safe_path = re.sub(r"[<>:\\|?*]", "_", path.lstrip("/"))
+    safe_path = re.sub(r"[<>:\|?*]", "_", path.lstrip("/"))
     safe_parts = [shorten_component(part) for part in safe_path.split("/") if part]
     safe_path = "/".join(safe_parts) if safe_parts else "index.html"
     local_path = output_dir / netloc / safe_path
@@ -196,57 +427,36 @@ def is_cloudflare_challenge(resp: requests.Response) -> bool:
 # ============================================================================
 
 def extract_asset_links(soup: BeautifulSoup, base_url: str) -> set[str]:
-    assets: set[str] = set()
+    links: set[str] = set()
+
     for tag, attrs in ASSET_ATTRS.items():
-        for node in soup.find_all(tag):
+        for elem in soup.find_all(tag):
             for attr in attrs:
-                value = node.get(attr)
-                if not value:
+                val = elem.get(attr)
+                if not val:
                     continue
                 if attr == "srcset":
-                    for u in normalize_srcset(value):
-                        assets.add(urljoin(base_url, u))
+                    for candidate in normalize_srcset(val):
+                        if not candidate.startswith(SKIP_SCHEMES):
+                            links.add(urljoin(base_url, candidate))
                 else:
-                    assets.add(urljoin(base_url, value))
+                    val = val.strip()
+                    if not val.startswith(SKIP_SCHEMES):
+                        links.add(urljoin(base_url, val))
 
-    allowed_link_rels = {
-        "stylesheet",
-        "icon",
-        "shortcut",
-        "shortcut icon",
-        "apple-touch-icon",
-        "manifest",
-        "preload",
-        "modulepreload",
-        "prefetch",
-    }
-    for node in soup.find_all("link", href=True):
-        rel_val = node.get("rel")
-        if isinstance(rel_val, list):
-            rel_tokens = {token.lower() for token in rel_val}
-        elif isinstance(rel_val, str):
-            rel_tokens = {rel_val.lower()}
-        else:
-            rel_tokens = set()
-        if not rel_tokens or rel_tokens.intersection(allowed_link_rels):
-            assets.add(urljoin(base_url, node["href"]))
+    for elem in soup.find_all(style=True):
+        style = elem["style"]
+        for match in re.finditer(r'url\((.*?)\)', style, re.I):
+            raw = match.group(1).strip("\"\' \t\r\n")
+            if raw and not raw.startswith(SKIP_SCHEMES):
+                links.add(urljoin(base_url, raw))
 
-    # Meta tags (og:image, twitter:image)
-    for meta in soup.find_all("meta"):
-        prop = (meta.get("property") or meta.get("name") or "").lower()
-        if prop in ("og:image", "twitter:image") and meta.get("content"):
-            assets.add(urljoin(base_url, meta["content"]))
+    for link in soup.find_all("link", href=True):
+        href = link["href"].strip()
+        if href and not href.startswith(SKIP_SCHEMES):
+            links.add(urljoin(base_url, href))
 
-    # CSS url() in style tags or inline styles
-    style_text = " ".join([tag.get_text() for tag in soup.find_all("style")])
-    for style_attr in soup.find_all(attrs={"style": True}):
-        style_text += " " + style_attr.get("style", "")
-    for match in re.finditer(r'url\s*\(\s*[\'"]?([^\'")]+)[\'"]?\s*\)', style_text):
-        u = match.group(1).strip()
-        if not u.startswith("data:"):
-            assets.add(urljoin(base_url, u))
-
-    return assets
+    return links
 
 
 def extract_page_links(soup: BeautifulSoup, base_url: str) -> set[str]:
@@ -288,16 +498,25 @@ def discover_sitemaps(start_url: str, session: requests.Session, timeout: int) -
 
     try:
         resp = session.get(robots_url, timeout=timeout)
-        if resp.ok:
+        if resp.status_code == 200:
             for line in resp.text.splitlines():
                 if line.lower().startswith("sitemap:"):
-                    sitemap_url = line.split(":", 1)[1].strip()
-                    if sitemap_url:
-                        candidates.add(sitemap_url)
+                    parts = line.split(":", 1)
+                    if len(parts) == 2 and is_http(parts[1].strip()):
+                        candidates.add(parts[1].strip())
     except requests.RequestException:
         pass
 
-    return candidates
+    valid_sitemaps: set[str] = set()
+    for sitemap_url in candidates:
+        try:
+            r = session.get(sitemap_url, timeout=timeout)
+            if r.status_code == 200 and ("xml" in (r.headers.get("Content-Type") or "") or r.text.strip().startswith("<?xml")):
+                valid_sitemaps.add(sitemap_url)
+        except requests.RequestException:
+            pass
+
+    return valid_sitemaps
 
 
 def collect_urls_from_sitemaps(
@@ -308,59 +527,50 @@ def collect_urls_from_sitemaps(
     include_related_hosts: bool,
     allow_external_pages: bool,
 ) -> set[str]:
-    pending = collections.deque(sorted(sitemap_urls))
-    visited: set[str] = set()
-    page_urls: set[str] = set()
-    max_sitemap_docs = 100
+    collected: set[str] = set()
+    seen_sitemaps: set[str] = set()
+    queue = list(sitemap_urls)
 
-    while pending and len(visited) < max_sitemap_docs:
-        sitemap_url = pending.popleft()
-        sitemap_url = canonicalize_url(sitemap_url, keep_query=False)
-
-        if sitemap_url in visited or not is_http(sitemap_url):
+    while queue:
+        sm = queue.pop(0)
+        if sm in seen_sitemaps:
             continue
-
-        visited.add(sitemap_url)
+        seen_sitemaps.add(sm)
 
         try:
-            resp = session.get(sitemap_url, timeout=timeout)
-        except requests.RequestException:
-            continue
-
-        if not resp.ok:
-            continue
-
-        found = parse_sitemap_xml(resp.text)
-
-        for u in found:
-            cu = canonicalize_url(u, keep_query=False)
-            if not cu:
+            resp = session.get(sm, timeout=timeout)
+            if resp.status_code != 200:
                 continue
-            if cu.endswith(".xml") and "sitemap" in cu:
-                if cu not in visited:
-                    pending.append(cu)
-            elif in_scope(cu, root_host, include_related_hosts, allow_external_pages):
-                page_urls.add(cu)
+            urls = parse_sitemap_xml(resp.text)
+            for u in urls:
+                if u.endswith(".xml"):
+                    if u not in seen_sitemaps:
+                        queue.append(u)
+                else:
+                    if in_scope(u, root_host, include_related_hosts, allow_external_pages):
+                        collected.add(u)
+        except requests.RequestException:
+            pass
 
-    return page_urls
+    return collected
 
 
 # ============================================================================
-# Crawler & Downloader
+# Web Crawler & Asset Downloader
 # ============================================================================
 
 def download_site(
     start_url: str,
     output_dir: pathlib.Path,
-    max_pages: int,
-    delay: float,
-    timeout: int,
-    user_agent: str,
-    include_related_hosts: bool,
-    keep_query_pages: bool,
-    allow_external_pages: bool,
+    max_pages: int = 2000,
+    delay: float = 0.05,
+    timeout: int = 20,
+    user_agent: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    include_related_hosts: bool = False,
+    keep_query_pages: bool = False,
+    allow_external_pages: bool = False,
     include_external_assets: bool = True,
-) -> pathlib.Path:
+) -> tuple[pathlib.Path, int, int]:
     start_url = canonicalize_url(start_url, keep_query=keep_query_pages)
     parsed_start = urlparse(start_url)
 
@@ -400,33 +610,31 @@ def download_site(
         if not url or url in seen_pages:
             continue
 
-        if not is_http(url) or not in_scope(url, root_host, include_related_hosts, allow_external_pages):
-            continue
-
+        local_path = to_local_path(url, output_dir)
         try:
             resp = session.get(url, timeout=timeout)
         except requests.RequestException as exc:
-            log(f"[WARN] Failed page {url}: {exc}")
+            log(f"[WARN] Failed fetching page {url}: {exc}")
+            continue
+
+        if resp.status_code != 200:
+            log(f"[WARN] HTTP {resp.status_code} for {url}")
+            continue
+
+        content_type = (resp.headers.get("Content-Type") or "").lower()
+        if "text/html" not in content_type and not url.endswith((".html", "/")):
+            asset_path = to_local_path(url, output_dir)
+            save_content(resp, asset_path)
+            downloaded_assets.add(url)
             continue
 
         if is_cloudflare_challenge(resp):
-            log(f"[WARN] Cloudflare challenge detected at {url}. Automated crawling is blocked for this host.")
-            seen_pages.add(url)
-            continue
+            log(f"[ERROR] Cloudflare Anti-Bot challenge detected on {url}. Bypassing or scraping gated content is prohibited.")
+            break
 
-        ct = resp.headers.get("Content-Type", "")
-        if "text/html" not in ct:
-            if url not in downloaded_assets:
-                path = to_local_path(url, output_dir)
-                save_content(resp, path)
-                downloaded_assets.add(url)
-                log(f"[ASSET] {url} -> {path}")
-            continue
-
+        save_content(resp, local_path)
         seen_pages.add(url)
-        page_path = to_local_path(url, output_dir)
-        save_content(resp, page_path)
-        log(f"[PAGE] {url} -> {page_path}")
+        log(f"[PAGE] {url} -> {local_path}")
 
         soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -446,7 +654,6 @@ def download_site(
             if not asset_url or asset_url in downloaded_assets or not is_http(asset_url):
                 continue
 
-            # Scope check: allow all assets if include_external_assets is True
             if not include_external_assets and not in_scope(asset_url, root_host, include_related_hosts, allow_external_pages):
                 continue
 
@@ -468,20 +675,15 @@ def download_site(
                 asset_path = to_local_path(asset_url, output_dir)
                 save_content(asset_resp, asset_path)
                 downloaded_assets.add(asset_url)
-                log(f"[ASSET] {asset_url} -> {asset_path}")
             except requests.RequestException as exc:
                 log(f"[WARN] Failed asset {asset_url}: {exc}")
 
         if delay > 0:
             time.sleep(delay)
 
-    log("\nCrawl complete.")
-    log(f"Pages downloaded: {len(seen_pages)}")
-    log(f"Assets downloaded: {len(downloaded_assets)}")
     target_dir = output_dir / root_host if (output_dir / root_host).exists() else output_dir
     neutralize_webflow_branding(target_dir)
-    log(f"Saved to: {target_dir.resolve()}")
-    return target_dir
+    return target_dir, len(seen_pages), len(downloaded_assets)
 
 
 def neutralize_webflow_branding(target_dir: pathlib.Path) -> None:
@@ -545,16 +747,13 @@ class ReactConverter:
         self.site_id: str = ""
 
     def run(self) -> None:
-        log(f"\n[REACT] Converting site from: {self.source_dir}")
         log(f"[REACT] Destination React project: {self.react_dir}")
-
         self._create_directories()
         html_files = self._collect_html_files()
         if not html_files:
             log(f"[ERROR] No HTML files found in {self.source_dir}")
             return
 
-        # Detect Webflow site ID from HTML files
         for f in html_files:
             try:
                 txt = f.read_text(encoding="utf-8", errors="ignore")
@@ -566,7 +765,7 @@ class ReactConverter:
             except OSError:
                 continue
 
-        log(f"[REACT] Found {len(html_files)} HTML pages.")
+        log(f"[REACT] Found {len(html_files)} HTML pages to convert.")
         self._localize_all_assets(html_files)
         neutralize_webflow_branding(self.assets_dir)
         self._extract_interaction_styles(html_files)
@@ -578,8 +777,7 @@ class ReactConverter:
         self._generate_vite_config()
         self._generate_main_jsx()
 
-        log(f"\n[SUCCESS] Successfully generated React app at: {self.react_dir}")
-        log("[SUCCESS] All routes, interactions, code splitting, and local assets are configured.")
+        log(f"[SUCCESS] Successfully generated React app at: {self.react_dir}")
 
     def _create_directories(self) -> None:
         for d in [
@@ -596,11 +794,9 @@ class ReactConverter:
         return sorted(list(self.source_dir.rglob("*.html")))
 
     def _localize_all_assets(self, html_files: list[pathlib.Path]) -> None:
-        """Finds all remote URLs (CDN, fonts, JS) across all HTML files and downloads them."""
         log("[REACT] Scanning HTML files for external CDN assets...")
         url_set: set[str] = set()
-
-        cdn_regex = re.compile(r'https?://[A-Za-z0-9\-._~:/?#\[\]@!$&\'()*+,;=%]+\.[a-zA-Z0-9]+(?:\?[^\s"\'><)]*)?', re.I)
+        cdn_regex = re.compile(r'''https?://[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+\.[a-zA-Z0-9]+(?:\?[^\s"'><)]*)?''', re.I)
 
         for file_path in html_files:
             try:
@@ -616,45 +812,47 @@ class ReactConverter:
                 ]):
                     url_set.add(u)
 
-            # Check for Google WebFont, jQuery, CloudFront, GSAP
             for script_match in re.finditer(r'<script[^>]+src=["\']([^"\']+)["\']', content, re.I):
                 src = script_match.group(1).strip()
                 if is_http(src):
                     url_set.add(src)
 
-        log(f"[REACT] Discovered {len(url_set)} unique asset URLs.")
-
-        # Download missing assets
         base_urls = [u for u in url_set if not re.search(r'-p-\d+\.', u)]
-        log(f"[REACT] Downloading {len(base_urls)} base assets in parallel...")
+        log(f"[REACT] Downloading {len(base_urls)} external CDN assets in parallel...")
 
-        downloaded, skipped, failed = 0, 0, 0
+        downloaded, failed = 0, 0
 
         def download_single(u: str) -> tuple[str, bool]:
             parsed = urlparse(u)
-            filename = posixpath.basename(parsed.path) or "asset"
-            filename = unquote(filename)
-            filename = re.sub(r'[<>:"/\\|?*]', '_', filename).replace(' ', '_')
+            clean_path = posixpath.normpath(unquote(parsed.path))
+            filename = posixpath.basename(clean_path)
+            if not filename:
+                return u, False
 
-            if u.endswith(".css") or "/css" in parsed.path:
-                dest = self.assets_dir / "css" / filename
-                web_path = f"/assets/css/{filename}"
-            elif u.endswith(".js") or "/js" in parsed.path:
-                dest = self.assets_dir / "js" / filename
-                web_path = f"/assets/js/{filename}"
+            ext = posixpath.splitext(filename)[1].lower()
+            if ext in [".png", ".jpg", ".jpeg", ".svg", ".gif", ".webp", ".avif", ".ico"]:
+                subdir = self.assets_dir / "images"
+                local_url = f"/assets/images/{filename}"
+            elif ext in [".css"]:
+                subdir = self.assets_dir / "css"
+                local_url = f"/assets/css/{filename}"
+            elif ext in [".js"]:
+                subdir = self.assets_dir / "js"
+                local_url = f"/assets/js/{filename}"
             else:
-                dest = self.assets_dir / "images" / filename
-                web_path = f"/assets/images/{filename}"
+                subdir = self.assets_dir / "images"
+                local_url = f"/assets/images/{filename}"
 
-            self.url_mapping[u] = web_path
+            dest = subdir / filename
+            self.url_mapping[u] = local_url
 
             if dest.exists() and dest.stat().st_size > 0:
                 return u, True
 
             try:
-                resp = self.session.get(u, timeout=15)
-                if resp.status_code == 200:
-                    dest.write_bytes(resp.content)
+                r = self.session.get(u, timeout=20)
+                if r.status_code == 200:
+                    dest.write_bytes(r.content)
                     return u, True
                 return u, False
             except requests.RequestException:
@@ -668,7 +866,6 @@ class ReactConverter:
                 else:
                     failed += 1
 
-        # Map responsive variants (-p-500, -p-800) to base image
         for u in url_set:
             if u not in self.url_mapping:
                 base_u = re.sub(r'-p-\d+(\.[a-zA-Z0-9]+)$', r'\1', u)
@@ -680,10 +877,8 @@ class ReactConverter:
         mapping_file = self.public_dir / "url-mapping.json"
         mapping_file.write_text(json.dumps(self.url_mapping, indent=2), encoding="utf-8")
         log(f"[REACT] Asset localization complete: {downloaded} downloaded/cached, {failed} failed.")
-        log(f"[REACT] URL mapping saved to {mapping_file}")
 
     def _extract_interaction_styles(self, html_files: list[pathlib.Path]) -> None:
-        """Extracts CSS animation/interaction initial state rules into page-interactions.css."""
         unique_styles: set[str] = set()
         unique_styles.add(
             "/* Suppress Webflow badge */\n"
@@ -706,7 +901,6 @@ class ReactConverter:
 
         css_path = self.styles_dir / "page-interactions.css"
         css_path.write_text("\n\n".join(unique_styles), encoding="utf-8")
-        log(f"[REACT] Extracted {len(unique_styles)} interaction style blocks to {css_path}")
 
     def _generate_hook(self) -> None:
         site_attr = f"    document.documentElement.setAttribute('data-wf-site', '{self.site_id}');\n" if self.site_id else ""
@@ -766,24 +960,16 @@ export default function useWebflow(pageId) {{
             val = val.strip()
             if not prop or not val:
                 continue
-
-            if prop.startswith("-webkit-"):
-                camel = "Webkit" + "".join(part.capitalize() for part in prop[8:].split("-"))
-            elif prop.startswith("-moz-"):
-                camel = "Moz" + "".join(part.capitalize() for part in prop[5:].split("-"))
-            elif prop.startswith("-ms-"):
-                camel = "ms" + "".join(part.capitalize() for part in prop[4:].split("-"))
-            else:
-                parts = prop.split("-")
-                camel = parts[0] + "".join(p.capitalize() for p in parts[1:])
-            styles[camel] = val
+            if prop.startswith("-"):
+                prop = prop[1:]
+            parts = prop.split("-")
+            camel_prop = parts[0] + "".join(x.title() for x in parts[1:])
+            styles[camel_prop] = val
         return json.dumps(styles)
 
     def _html_to_jsx(self, html: str) -> str:
-        # 1. Remove comments
         jsx = re.sub(r'<!--[\s\S]*?-->', '', html)
 
-        # 2. Embedded <style> inside body
         def replace_style(m: re.Match) -> str:
             attrs = m.group(1)
             content = json.dumps(m.group(2).strip())
@@ -791,7 +977,6 @@ export default function useWebflow(pageId) {{
 
         jsx = re.sub(r'<style\b([^>]*)>([\s\S]*?)</style>', replace_style, jsx, flags=re.I)
 
-        # 3. JSON scripts (lightboxes, data nodes)
         def replace_json_script(m: re.Match) -> str:
             attrs = m.group(1)
             content = m.group(2)
@@ -803,7 +988,6 @@ export default function useWebflow(pageId) {{
 
         jsx = re.sub(r'<script([^>]*type=["\']application/json["\'][^>]*)>([\s\S]*?)</script>', replace_json_script, jsx, flags=re.I)
 
-        # 4. Templates
         def replace_template(m: re.Match) -> str:
             attrs = m.group(1)
             content = m.group(2)
@@ -815,33 +999,21 @@ export default function useWebflow(pageId) {{
 
         jsx = re.sub(r'<script([^>]*type=["\']text/x-wf-template["\'][^>]*)>([\s\S]*?)</script>', replace_template, jsx, flags=re.I)
 
-        # 5. Replace mapped URLs
         for remote_url, local_path in self.url_mapping.items():
             jsx = jsx.replace(remote_url, local_path)
             encoded = urllib.parse.quote(remote_url, safe="/:?=&%")
             if encoded != remote_url:
                 jsx = jsx.replace(encoded, local_path)
 
-        # Replace any residual CDN URL format
-        jsx = re.sub(r'https?://cdn\.prod\.website-files\.com/[^\s"\'><)]+', lambda m: f"/assets/images/{posixpath.basename(m.group(0))}", jsx)
+        jsx = re.sub(r'\bclass="', 'className="', jsx)
+        jsx = re.sub(r'\bfor="', 'htmlFor="', jsx)
+        jsx = re.sub(r'\btabindex="', 'tabIndex="', jsx)
 
-        # Replace live domain with relative routes
-        jsx = re.sub(r'https?://[a-zA-Z0-9\-.]+\.webflow\.io/', '/', jsx)
-
-        # 6. Attributes conversion
-        jsx = re.sub(r'\bclass="([^"]*)"', r'className="\1"', jsx)
-        jsx = re.sub(r'\bfor="([^"]*)"', r'htmlFor="\1"', jsx)
-        jsx = re.sub(r'\btabindex="([^"]*)"', r'tabIndex="\1"', jsx, flags=re.I)
-        jsx = re.sub(r'\bautocomplete="([^"]*)"', r'autoComplete="\1"', jsx, flags=re.I)
-        jsx = re.sub(r'\bautofocus\b', 'autoFocus', jsx, flags=re.I)
-        jsx = re.sub(r'\binputmode="([^"]*)"', r'inputMode="\1"', jsx, flags=re.I)
-
-        # Input value -> defaultValue
-        jsx = re.sub(r'<input\b(?![^>]*\btype=["\'](?:button|submit)["\'])([^>]*?)\bvalue="([^"]*)"([^>]*?)>', r'<input\1defaultValue="\2"\3>', jsx, flags=re.I)
-
-        # SVG attributes
         svg_attrs = [
             ("stroke-width", "strokeWidth"),
+            ("stroke-miterlimit", "strokeMiterlimit"),
+            ("stroke-dasharray", "strokeDasharray"),
+            ("stroke-dashoffset", "strokeDashoffset"),
             ("stroke-linecap", "strokeLinecap"),
             ("stroke-linejoin", "strokeLinejoin"),
             ("clip-rule", "clipRule"),
@@ -856,17 +1028,13 @@ export default function useWebflow(pageId) {{
         for src, dest in svg_attrs:
             jsx = re.sub(rf'\b{src}="([^"]*)"', rf'{dest}="\1"', jsx, flags=re.I)
 
-        # Style attribute to JSX style object
         def replace_inline_style(m: re.Match) -> str:
             style_content = m.group(1)
             style_obj = self._style_str_to_jsx(style_content)
             return f"style={{{style_obj}}}"
 
         jsx = re.sub(r'\bstyle="([^"]*)"', replace_inline_style, jsx)
-
-        # Self-closing void tags
-        jsx = re.sub(r'<(img|input|br|hr)([^>]*?)(?<!/)>', r'<\1\2 />', jsx, flags=re.I)
-
+        jsx = re.sub(r'<(img|input|br|hr|embed|col|source|track|wbr)([^>]*?)(?<!/)>', r'<\1\2 />', jsx, flags=re.I)
         return jsx
 
     def _convert_pages(self, html_files: list[pathlib.Path]) -> list[dict]:
@@ -879,7 +1047,6 @@ export default function useWebflow(pageId) {{
             except OSError:
                 continue
 
-            # Route
             route = "/" + re.sub(r'(?:^|/)(?:index)?\.html$', '', rel).lstrip("/")
             if not route:
                 route = "/"
@@ -891,15 +1058,11 @@ export default function useWebflow(pageId) {{
             if not body_match:
                 continue
             body_html = body_match.group(1)
-
-            # Strip external bottom scripts
             body_html = re.sub(r'<script[^>]*src=[\s\S]*?</script>', '', body_html, flags=re.I)
-            # Strip non-template/non-json inline scripts
             body_html = re.sub(r'<script(?![^>]*type=["\'](?:text/x-wf-template|application/json)["\'])[\s\S]*?</script>', '', body_html, flags=re.I)
 
             converted_jsx = self._html_to_jsx(body_html)
 
-            # Component Name
             clean_rel = re.sub(r'(/index)?\.html$', '', rel)
             if not clean_rel or clean_rel == "index":
                 comp_name = "Home"
@@ -917,11 +1080,9 @@ export default function useWebflow(pageId) {{
             out_file = self.pages_dir / out_rel
             out_file.parent.mkdir(parents=True, exist_ok=True)
 
-            # Calculate relative path to hook
             depth = len(out_rel.split("/")) - 1
             hook_rel = "../" * (depth + 1) + "hooks/useWebflow"
 
-            # Check for custom scripts (e.g. GSAP marquee in career)
             extra_imports = ""
             extra_hooks = ""
             if "showcase-marquee-list" in html_text and "gsap" in html_text:
@@ -998,7 +1159,6 @@ export default function {comp_name}() {{
         if not routes:
             return
 
-        # Ensure root route exists
         active_routes = list(routes)
         if not any(r["route"] == "/" for r in active_routes):
             active_routes.insert(0, {
@@ -1058,11 +1218,9 @@ export default function App() {{
     def _generate_index_html(self, sample_html: pathlib.Path) -> None:
         html_text = sample_html.read_text(encoding="utf-8", errors="ignore")
 
-        # Extract title
         title_m = re.search(r'<title>([^<]+)</title>', html_text, re.I)
         title = title_m.group(1).strip() if title_m else "React Webflow App"
 
-        # Extract Google font links & preconnects
         font_tags = []
         for m in re.finditer(r'<link[^>]+(?:fonts\.googleapis\.com|fonts\.gstatic\.com)[^>]*>', html_text, re.I):
             font_tags.append(m.group(0))
@@ -1073,12 +1231,10 @@ export default function App() {{
                 '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />'
             ]
 
-        # Extract WebFont script blocks if present
         webfont_scripts = []
         for m in re.finditer(r'<script[^>]*>(?:[\s\S]*?WebFont\.load[\s\S]*?)</script>', html_text, re.I):
             webfont_scripts.append(m.group(0))
 
-        # Extract favicons
         favicon_tags = []
         for m in re.finditer(r'<link[^>]+rel=["\'](?:shortcut icon|icon|apple-touch-icon)["\'][^>]*>', html_text, re.I):
             tag = m.group(0)
@@ -1086,11 +1242,9 @@ export default function App() {{
                 tag = tag.replace(remote_u, local_p)
             favicon_tags.append(tag)
 
-        # Collect CSS and JS files in assets
         css_files = [f"/assets/css/{f.name}" for f in (self.assets_dir / "css").glob("*.css")]
         js_files = [f"/assets/js/{f.name}" for f in (self.assets_dir / "js").glob("*.js")]
 
-        # Put critical runtime first
         ordered_js = []
         for name in ["jquery", "webfont", "webflow.schunk", "webflow", "gsap", "Observer"]:
             for j in js_files:
@@ -1117,7 +1271,7 @@ export default function App() {{
     {css_tags}
     {webfonts_html}
     <script type="text/javascript">
-      window.__WEBFLOW_CURRENCY_SETTINGS = {{"currencyCode":"USD","symbol":"$","decimal":".","fractionDigits":2,"group":",","template":"{{{{wf \\"path\\":\\"symbol\\",\\"type\\":\\"PlainText\\"}}}} {{{{wf \\"path\\":\\"amount\\",\\"type\\":\\"CommercePrice\\"}}}} {{{{wf \\"path\\":\\"currencyCode\\",\\"type\\":\\"PlainText\\"}}}}","hideDecimalForWholeNumbers":false}};
+      window.__WEBFLOW_CURRENCY_SETTINGS = {{"currencyCode":"USD","symbol":"$","decimal":".","fractionDigits":2,"group":",","template":"{{{{wf \"path\":\"symbol\",\"type\":\"PlainText\"}}}} {{{{wf \"path\":\"amount\",\"type\":\"CommercePrice\"}}}} {{{{wf \"path\":\"currencyCode\",\"type\":\"PlainText\"}}}}","hideDecimalForWholeNumbers":false}};
       !function(o,c){{var n=c.documentElement,t=" w-mod-";n.className+=t+"js",("ontouchstart"in o||o.DocumentTouch&&c instanceof DocumentTouch)&&(n.className+=t+"touch")}}(window,document);
     </script>
   </head>
@@ -1162,104 +1316,214 @@ export default defineConfig({
   plugins: [react()],
   server: {
     port: 5173,
-  },
+    open: true
+  }
 });
 """
         (self.react_dir / "vite.config.js").write_text(vite_config, encoding="utf-8")
 
     def _generate_main_jsx(self) -> None:
-        main_code = """import { createRoot } from 'react-dom/client';
+        main_jsx = """import React from 'react';
+import ReactDOM from 'react-dom/client';
 import { BrowserRouter } from 'react-router-dom';
-import './styles/page-interactions.css';
 import App from './App.jsx';
+import './styles/page-interactions.css';
 
-createRoot(document.getElementById('root')).render(
-  <BrowserRouter>
-    <App />
-  </BrowserRouter>
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <React.StrictMode>
+    <BrowserRouter>
+      <App />
+    </BrowserRouter>
+  </React.StrictMode>
 );
 """
-        (self.src_dir / "main.jsx").write_text(main_code, encoding="utf-8")
+        (self.src_dir / "main.jsx").write_text(main_jsx, encoding="utf-8")
 
 
 # ============================================================================
-# CLI & Entry Point
+# Automated npm Build & Server Launcher
 # ============================================================================
 
-def parse_args() -> argparse.Namespace:
+def install_and_build(react_dir: pathlib.Path) -> bool:
+    """Installs npm dependencies and compiles production Vite bundle."""
+    npm_cmd = shutil.which("npm") or shutil.which("npm.cmd")
+    if not npm_cmd:
+        UI.warn("Node.js / npm not detected in PATH. Skipping automated npm install.")
+        return False
+
+    UI.item("Running 'npm install'...", status="step")
+    try:
+        proc = subprocess.run([npm_cmd, "install"], cwd=str(react_dir), capture_output=True, text=True)
+        if proc.returncode != 0:
+            UI.warn(f"npm install completed with warnings:\n{proc.stderr[:300]}")
+        else:
+            UI.item("npm packages installed successfully", status="ok")
+    except Exception as e:
+        UI.warn(f"Failed to run npm install: {e}")
+        return False
+
+    UI.item("Running 'npm run build'...", status="step")
+    try:
+        proc_b = subprocess.run([npm_cmd, "run", "build"], cwd=str(react_dir), capture_output=True, text=True)
+        if proc_b.returncode != 0:
+            UI.warn(f"npm run build failed:\n{proc_b.stderr[:300]}")
+            return False
+        else:
+            UI.item("Vite production bundle compiled successfully", status="ok")
+            return True
+    except Exception as e:
+        UI.warn(f"Failed to run npm run build: {e}")
+        return False
+
+
+def launch_server(react_dir: pathlib.Path, port: int = 5173) -> None:
+    """Launches local Vite preview server."""
+    npm_cmd = shutil.which("npm") or shutil.which("npm.cmd")
+    if not npm_cmd:
+        return
+    print()
+    UI.box("Local Preview Server", [
+        f"Server starting on: {UI.CYAN}http://localhost:{port}/{UI.RESET}",
+        f"Press {UI.BOLD}Ctrl+C{UI.RESET} in this terminal to exit."
+    ], border_color=UI.GREEN)
+    print()
+    try:
+        subprocess.run([npm_cmd, "run", "preview", "--", "--port", str(port), "--host"], cwd=str(react_dir))
+    except KeyboardInterrupt:
+        print(f"\n{UI.GRAY}Server stopped.{UI.RESET}")
+
+
+# ============================================================================
+# Interactive Wizard & CLI Entry Point
+# ============================================================================
+
+def interactive_wizard(args: argparse.Namespace | None = None) -> None:
+    UI.banner()
+    UI.system_status()
+
+    w = 68
+    print(f"{UI.CYAN}╭─ Project Setup Wizard ─────────────────────────────────────────────╮{UI.RESET}")
+    print(f"{UI.CYAN}│{UI.RESET}  {UI.GRAY}Follow the steps below to download and convert any website:{UI.RESET}{' ' * (w - 61)}{UI.CYAN}│{UI.RESET}")
+    print(f"{UI.CYAN}╰{'─' * w}╯{UI.RESET}\n")
+
+    while True:
+        url = UI.prompt("Target Website URL (e.g. https://example.com):")
+        if not url:
+            UI.warn("URL cannot be empty. Please enter a valid URL.")
+            continue
+        if not (url.startswith("http://") or url.startswith("https://")):
+            url = "https://" + url
+        break
+
+    parsed = urlparse(url)
+    default_name = normalize_netloc(parsed).replace(".", "-").replace(":", "_")
+    if default_name.endswith("-webflow-io"):
+        default_name = default_name.replace("-webflow-io", "")
+
+    to_react = UI.confirm("Convert website into a modern Vite + React SPA?", default=True)
+
+    default_out = f"{default_name}-react" if to_react else default_name
+    out_dir_str = UI.prompt("Output project folder name", default=default_out)
+    out_dir = pathlib.Path(out_dir_str)
+
+    auto_build = False
+    launch_dev = False
+    if to_react:
+        auto_build = UI.confirm("Automatically install npm packages & build production bundle?", default=True)
+        if auto_build:
+            launch_dev = UI.confirm("Launch local preview server when finished?", default=True)
+
+    total_steps = 4 if (to_react and auto_build) else (3 if to_react else 2)
+
+    UI.step(1, total_steps, "Crawling Website & Discovering Assets")
+    raw_dir = out_dir.parent / f"{out_dir.name}-raw" if to_react else out_dir
+
+    max_pages = args.max_pages if args else 2000
+    delay = args.delay if args else 0.05
+    timeout = args.timeout if args else 20
+    user_agent = args.user_agent if args else "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    include_related_hosts = args.include_related_hosts if args else False
+    keep_query_pages = args.keep_query_pages if args else False
+    allow_external_pages = args.allow_external_pages if args else False
+    include_external_assets = args.include_external_assets if args else True
+
+    target_dir, total_pages, total_assets = download_site(
+        start_url=url,
+        output_dir=raw_dir,
+        max_pages=max_pages,
+        delay=delay,
+        timeout=timeout,
+        user_agent=user_agent,
+        include_related_hosts=include_related_hosts,
+        keep_query_pages=keep_query_pages,
+        allow_external_pages=allow_external_pages,
+        include_external_assets=include_external_assets,
+    )
+    UI.item(f"Downloaded {total_pages} HTML pages and {total_assets} assets", status="ok")
+
+    react_dest = None
+    if to_react:
+        UI.step(2, total_steps, "Generating React SPA & Disarming Webflow Badge")
+        react_dest = out_dir
+        converter = ReactConverter(source_dir=target_dir, react_dir=react_dest)
+        converter.run()
+
+        if auto_build:
+            UI.step(3, total_steps, "Installing Dependencies & Compiling Production Bundle")
+            install_and_build(react_dest)
+
+    UI.success_card(
+        target_dir=target_dir,
+        total_pages=total_pages,
+        total_assets=total_assets,
+        react_dir=react_dest
+    )
+
+    if launch_dev and react_dest:
+        launch_server(react_dest)
+
+
+def parse_args():
+    import argparse
     parser = argparse.ArgumentParser(
         description="Download websites with all assets (including CDNs) and automatically convert them into modern Vite + React apps."
     )
     parser.add_argument("url", nargs="?", default=None, help="Start URL to download, e.g. https://www.example.com")
-    parser.add_argument("-o", "--output", default="downloaded_site", help="Output directory for downloaded site (default: downloaded_site)")
-    parser.add_argument("--max-pages", type=int, default=2000, help="Maximum HTML pages to crawl (default: 2000)")
-    parser.add_argument("--delay", type=float, default=0.1, help="Delay between page requests in seconds (default: 0.1)")
-    parser.add_argument("--timeout", type=int, default=20, help="HTTP timeout seconds (default: 20)")
-    parser.add_argument(
-        "--include-related-hosts",
-        action="store_true",
-        help="Also crawl hosts under the same root domain.",
-    )
-    parser.add_argument(
-        "--keep-query-pages",
-        action="store_true",
-        help="Treat query-string page URLs as unique pages.",
-    )
-    parser.add_argument(
-        "--allow-external-pages",
-        action="store_true",
-        help="Allow crawling HTML pages on other external hosts discovered.",
-    )
-    parser.add_argument(
-        "--user-agent",
-        default="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        help="User-Agent string",
-    )
-    parser.add_argument(
-        "--no-external-assets",
-        action="store_false",
-        dest="include_external_assets",
-        default=True,
-        help="Do not download external CDN assets (default is to download all CDN assets)",
-    )
-    parser.add_argument(
-        "--to-react",
-        nargs="?",
-        const="",
-        default=None,
-        help="Convert downloaded site into a Vite + React app (optional path: --to-react [OUTPUT_DIR])",
-    )
-    parser.add_argument(
-        "--convert-dir",
-        default=None,
-        help="Convert an existing directory of HTML/assets to a React app without downloading",
-    )
-    parser.add_argument(
-        "--react-out",
-        default=None,
-        help="Output directory when using --convert-dir",
-    )
+    parser.add_argument("-o", "--output", default="downloaded_site", help="Output directory for downloaded site")
+    parser.add_argument("--max-pages", type=int, default=2000, help="Maximum HTML pages to crawl")
+    parser.add_argument("--delay", type=float, default=0.05, help="Delay between page requests in seconds")
+    parser.add_argument("--timeout", type=int, default=20, help="HTTP timeout seconds")
+    parser.add_argument("--include-related-hosts", action="store_true", help="Also crawl hosts under the same root domain")
+    parser.add_argument("--keep-query-pages", action="store_true", help="Treat query-string page URLs as unique pages")
+    parser.add_argument("--allow-external-pages", action="store_true", help="Allow crawling HTML pages on other external hosts")
+    parser.add_argument("--user-agent", default="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", help="User-Agent string")
+    parser.add_argument("--no-external-assets", action="store_false", dest="include_external_assets", default=True, help="Do not download CDN assets")
+    parser.add_argument("--to-react", nargs="?", const="", default=None, help="Convert downloaded site into Vite + React app")
+    parser.add_argument("--convert-dir", default=None, help="Convert existing directory of HTML/assets without downloading")
+    parser.add_argument("--react-out", default=None, help="Output directory when using --convert-dir")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
 
-    # Mode 1: Convert an existing directory directly
+    # If no arguments provided: run the interactive OpenCode UI wizard
+    if not args.url and not args.convert_dir:
+        interactive_wizard(args)
+        return
+
+    # Direct conversion mode
     if args.convert_dir:
         src = pathlib.Path(args.convert_dir)
         dest = pathlib.Path(args.react_out) if args.react_out else src.parent / f"{src.name}-react"
         converter = ReactConverter(source_dir=src, react_dir=dest)
         converter.run()
+        UI.success_card(target_dir=src, total_pages=len(list(src.rglob("*.html"))), total_assets=0, react_dir=dest)
         return
 
-    # Mode 2: Download site
-    if not args.url:
-        log("[ERROR] Please provide a URL to download or use --convert-dir.")
-        return
-
+    # Headless CLI download mode
     out_dir = pathlib.Path(args.output)
-    downloaded_path = download_site(
+    target_dir, total_pages, total_assets = download_site(
         start_url=args.url,
         output_dir=out_dir,
         max_pages=args.max_pages,
@@ -1272,11 +1536,13 @@ def main() -> None:
         include_external_assets=args.include_external_assets,
     )
 
-    # Optional automatic conversion to React
+    react_dest = None
     if args.to_react is not None:
         react_dest = pathlib.Path(args.to_react) if args.to_react else out_dir.parent / f"{out_dir.name}-react"
-        converter = ReactConverter(source_dir=downloaded_path, react_dir=react_dest)
+        converter = ReactConverter(source_dir=target_dir, react_dir=react_dest)
         converter.run()
+
+    UI.success_card(target_dir=target_dir, total_pages=total_pages, total_assets=total_assets, react_dir=react_dest)
 
 
 if __name__ == "__main__":
