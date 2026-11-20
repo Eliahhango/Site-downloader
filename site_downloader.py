@@ -542,6 +542,7 @@ class ReactConverter:
         self.session = session or requests.Session()
         self.session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
         self.url_mapping: dict[str, str] = {}
+        self.site_id: str = ""
 
     def run(self) -> None:
         log(f"\n[REACT] Converting site from: {self.source_dir}")
@@ -552,6 +553,18 @@ class ReactConverter:
         if not html_files:
             log(f"[ERROR] No HTML files found in {self.source_dir}")
             return
+
+        # Detect Webflow site ID from HTML files
+        for f in html_files:
+            try:
+                txt = f.read_text(encoding="utf-8", errors="ignore")
+                m = re.search(r'data-wf-site=["\']([^"\']+)["\']', txt)
+                if m:
+                    self.site_id = m.group(1)
+                    log(f"[REACT] Detected Webflow site ID: {self.site_id}")
+                    break
+            except OSError:
+                continue
 
         log(f"[REACT] Found {len(html_files)} HTML pages.")
         self._localize_all_assets(html_files)
@@ -696,50 +709,50 @@ class ReactConverter:
         log(f"[REACT] Extracted {len(unique_styles)} interaction style blocks to {css_path}")
 
     def _generate_hook(self) -> None:
-        hook_code = """import { useEffect } from 'react';
+        site_attr = f"    document.documentElement.setAttribute('data-wf-site', '{self.site_id}');\n" if self.site_id else ""
+        hook_code = f"""import {{ useEffect }} from 'react';
 
-export default function useWebflow(pageId) {
-  useEffect(() => {
-    if (pageId) {
+export default function useWebflow(pageId) {{
+  useEffect(() => {{
+    if (pageId) {{
       document.documentElement.setAttribute('data-wf-page', pageId);
-    }
-    document.documentElement.setAttribute('data-wf-site', '687200b8c9f5527264575f0b');
-
-    if (!document.documentElement.classList.contains('w-mod-js')) {
+    }}
+{site_attr}
+    if (!document.documentElement.classList.contains('w-mod-js')) {{
       document.documentElement.classList.add('w-mod-js');
-    }
+    }}
 
     window.scrollTo(0, 0);
 
-    const timer = setTimeout(() => {
-      if (window.Webflow) {
-        try {
-          if (window.Webflow.destroy) {
+    const timer = setTimeout(() => {{
+      if (window.Webflow) {{
+        try {{
+          if (window.Webflow.destroy) {{
             window.Webflow.destroy();
-          }
-          if (window.Webflow.ready) {
+          }}
+          if (window.Webflow.ready) {{
             window.Webflow.ready();
-          }
+          }}
           const ix2 = window.Webflow.require && window.Webflow.require('ix2');
-          if (ix2 && ix2.init) {
+          if (ix2 && ix2.init) {{
             ix2.init();
-          }
-        } catch (e) {
+          }}
+        }} catch (e) {{
           console.warn('Webflow reinit warning:', e);
-        }
-      }
-    }, 50);
+        }}
+      }}
+    }}, 50);
 
-    return () => {
+    return () => {{
       clearTimeout(timer);
-      if (window.Webflow && window.Webflow.destroy) {
-        try {
+      if (window.Webflow && window.Webflow.destroy) {{
+        try {{
           window.Webflow.destroy();
-        } catch (e) {}
-      }
-    };
-  }, [pageId]);
-}
+        }} catch (e) {{}}
+      }}
+    }};
+  }}, [pageId]);
+}}
 """
         (self.hooks_dir / "useWebflow.js").write_text(hook_code, encoding="utf-8")
 
@@ -867,7 +880,7 @@ export default function useWebflow(pageId) {
                 continue
 
             # Route
-            route = "/" + re.sub(r'(?:^|/)index\.html$', '', rel).lstrip("/")
+            route = "/" + re.sub(r'(?:^|/)(?:index)?\.html$', '', rel).lstrip("/")
             if not route:
                 route = "/"
 
@@ -887,16 +900,19 @@ export default function useWebflow(pageId) {
             converted_jsx = self._html_to_jsx(body_html)
 
             # Component Name
-            raw_name = rel.replace("/index.html", "").replace("index.html", "Home")
-            parts = [re.sub(r'[^a-zA-Z0-9]', '', p.title()) for p in raw_name.split("/")]
-            comp_name = "_".join(parts)
+            clean_rel = re.sub(r'(/index)?\.html$', '', rel)
+            if not clean_rel or clean_rel == "index":
+                comp_name = "Home"
+            else:
+                parts = [re.sub(r'[^a-zA-Z0-9]', '', p.title()) for p in clean_rel.split("/")]
+                comp_name = "_".join(parts)
             if comp_name[0].isdigit():
                 comp_name = "Page" + comp_name
 
             if rel == "index.html":
                 out_rel = "Home.jsx"
             else:
-                out_rel = re.sub(r'/index\.html$', '.jsx', rel)
+                out_rel = re.sub(r'(/index)?\.html$', '.jsx', rel)
 
             out_file = self.pages_dir / out_rel
             out_file.parent.mkdir(parents=True, exist_ok=True)
@@ -979,12 +995,28 @@ export default function {comp_name}() {{
         return routes
 
     def _generate_app(self, routes: list[dict]) -> None:
+        if not routes:
+            return
+
+        # Ensure root route exists
+        active_routes = list(routes)
+        if not any(r["route"] == "/" for r in active_routes):
+            active_routes.insert(0, {
+                "route": "/",
+                "name": active_routes[0]["name"],
+                "import_path": active_routes[0]["import_path"],
+            })
+
         lazy_imports = "\n".join(
-            [f"const {r['name']} = lazy(() => import('{r['import_path']}'));" for r in routes]
+            [f"const {r['name']} = lazy(() => import('{r['import_path']}'));" for r in active_routes]
         )
         route_elements = "\n".join(
-            [f'          <Route path="{r["route"]}" element={{<{r["name"]} />}} />' for r in routes]
+            [f'          <Route path="{r["route"]}" element={{<{r["name"]} />}} />' for r in active_routes]
         )
+
+        has_404 = next((r for r in active_routes if "404" in r["route"]), None)
+        fallback_comp = has_404["name"] if has_404 else active_routes[0]["name"]
+        route_elements += f'\n          <Route path="*" element={{<{fallback_comp} />}} />'
 
         app_code = f"""import React, {{ useEffect, Suspense, lazy }} from 'react';
 import {{ Routes, Route, useNavigate, useLocation }} from 'react-router-dom';
@@ -1026,13 +1058,41 @@ export default function App() {{
     def _generate_index_html(self, sample_html: pathlib.Path) -> None:
         html_text = sample_html.read_text(encoding="utf-8", errors="ignore")
 
+        # Extract title
+        title_m = re.search(r'<title>([^<]+)</title>', html_text, re.I)
+        title = title_m.group(1).strip() if title_m else "React Webflow App"
+
+        # Extract Google font links & preconnects
+        font_tags = []
+        for m in re.finditer(r'<link[^>]+(?:fonts\.googleapis\.com|fonts\.gstatic\.com)[^>]*>', html_text, re.I):
+            font_tags.append(m.group(0))
+        if not font_tags:
+            font_tags = [
+                '<link rel="preconnect" href="https://fonts.googleapis.com" />',
+                '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />',
+                '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />'
+            ]
+
+        # Extract WebFont script blocks if present
+        webfont_scripts = []
+        for m in re.finditer(r'<script[^>]*>(?:[\s\S]*?WebFont\.load[\s\S]*?)</script>', html_text, re.I):
+            webfont_scripts.append(m.group(0))
+
+        # Extract favicons
+        favicon_tags = []
+        for m in re.finditer(r'<link[^>]+rel=["\'](?:shortcut icon|icon|apple-touch-icon)["\'][^>]*>', html_text, re.I):
+            tag = m.group(0)
+            for remote_u, local_p in self.url_mapping.items():
+                tag = tag.replace(remote_u, local_p)
+            favicon_tags.append(tag)
+
         # Collect CSS and JS files in assets
         css_files = [f"/assets/css/{f.name}" for f in (self.assets_dir / "css").glob("*.css")]
         js_files = [f"/assets/js/{f.name}" for f in (self.assets_dir / "js").glob("*.js")]
 
-        # Put schunk and main runtime first
+        # Put critical runtime first
         ordered_js = []
-        for name in ["jquery", "webflow.schunk", "webflow", "gsap", "Observer"]:
+        for name in ["jquery", "webfont", "webflow.schunk", "webflow", "gsap", "Observer"]:
             for j in js_files:
                 if name in j.lower() and j not in ordered_js:
                     ordered_js.append(j)
@@ -1042,17 +1102,20 @@ export default function App() {{
 
         css_tags = "\n    ".join([f'<link rel="stylesheet" href="{c}" />' for c in css_files])
         js_tags = "\n    ".join([f'<script src="{j}"></script>' for j in ordered_js])
+        fonts_html = "\n    ".join(font_tags)
+        favicons_html = "\n    ".join(favicon_tags)
+        webfonts_html = "\n    ".join(webfont_scripts)
 
         index_html = f"""<!doctype html>
 <html lang="en" class="w-mod-js">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>React Webflow App</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Inter+Tight:wght@300;400;500;600;700&family=Plus+Jakarta+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+    <title>{title}</title>
+    {fonts_html}
+    {favicons_html}
     {css_tags}
+    {webfonts_html}
     <script type="text/javascript">
       window.__WEBFLOW_CURRENCY_SETTINGS = {{"currencyCode":"USD","symbol":"$","decimal":".","fractionDigits":2,"group":",","template":"{{{{wf \\"path\\":\\"symbol\\",\\"type\\":\\"PlainText\\"}}}} {{{{wf \\"path\\":\\"amount\\",\\"type\\":\\"CommercePrice\\"}}}} {{{{wf \\"path\\":\\"currencyCode\\",\\"type\\":\\"PlainText\\"}}}}","hideDecimalForWholeNumbers":false}};
       !function(o,c){{var n=c.documentElement,t=" w-mod-";n.className+=t+"js",("ontouchstart"in o||o.DocumentTouch&&c instanceof DocumentTouch)&&(n.className+=t+"touch")}}(window,document);
